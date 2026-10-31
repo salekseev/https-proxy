@@ -13,4 +13,11 @@ envsubst '${NGINX_LOCAL_RESOLVERS}' \
 rm -f /etc/nginx/conf.d/nginx.conf
 
 /app/generate.sh
+
+# Unknown HTTPS hosts need a certificate before an HTTP response can be sent.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -nodes -days 365 -subj '/CN=localhost' \
+    -keyout /app/generated/default.key -out /app/generated/default.crt
+chmod 600 /app/generated/default.key
+
 exec nginx -g 'daemon off;'

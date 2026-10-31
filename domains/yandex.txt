@@ -26,3 +26,14 @@ uniproxy.alice.yandex.net
 ws.api.music.yandex.net
 !*.s3.yandex.net
 !*.svc.cdn.yandex.net
+!samplelib.com
+!*.strm.yandex.net
+www.google.com
+connectivitycheck.gstatic.com
+play.googleapis.com
+tracking.appmetrica.yandex.net
+analytics.mobile.yandex.net
+rosenberg.appmetrica.yandex.net
+zen.report.appmetrica.yandex.net
+redirect.appmetrica.yandex.com
+certificate.mobile.yandex.net
