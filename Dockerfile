@@ -1,20 +1,18 @@
 FROM nginx:1.27-alpine
 
-RUN apk add --no-cache openssl
+RUN apk add --no-cache openssl ca-certificates
 
 WORKDIR /app
 COPY certs/ certs/
 COPY domains/ domains/
-COPY generate.sh generate.sh
-COPY start.sh start.sh
+COPY generate.sh start.sh ./
 COPY nginx.conf /etc/nginx/templates/nginx.conf.template
 
-RUN chmod +x generate.sh start.sh && mkdir -p generated && rm -f /etc/nginx/conf.d/default.conf
+RUN chmod +x generate.sh start.sh && mkdir -p generated certs \
+    && rm -f /etc/nginx/conf.d/default.conf
 
 EXPOSE 80 443
 
-# Generate at startup so *_UPSTREAM_URL variables can be supplied at runtime.
-ENV NGINX_ENTRYPOINT_LOCAL_RESOLVERS=true
-ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx
-
-CMD ["/app/start.sh"]
+# start.sh explicitly renders templates before generation and Nginx startup.
+ENTRYPOINT ["/app/start.sh"]
+CMD []

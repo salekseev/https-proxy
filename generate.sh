@@ -1,187 +1,146 @@
 #!/bin/sh
 set -eu
+umask 077
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DOMAINS_DIR=$SCRIPT_DIR/domains
-CA_CERT=$SCRIPT_DIR/certs/ca.crt
-CA_KEY=$SCRIPT_DIR/certs/ca.key
+CA_CERT=${CA_CERT:-$SCRIPT_DIR/certs/ca.crt}
+CA_KEY=${CA_KEY:-$SCRIPT_DIR/certs/ca.key}
 OUTPUT_DIR=$SCRIPT_DIR/generated
-CERT_OUTPUT_DIR=$OUTPUT_DIR/certs
-CONFIG_OUTPUT_DIR=$OUTPUT_DIR/configs
 NGINX_ROOT=${NGINX_ROOT:-/app}
 
-# secp384r1 is an elliptic-curve parameter supported by OpenSSL.
-EC_CURVE=secp384r1
-
-if [ ! -d "$DOMAINS_DIR" ]; then
-    printf '%s\n' "domains directory is missing" >&2
-    exit 1
-fi
-if [ ! -r "$CA_CERT" ] || [ ! -r "$CA_KEY" ]; then
-    printf '%s\n' "certs/ca.crt and certs/ca.key must be present and readable" >&2
-    exit 1
-fi
-
-# Generated files are rebuilt so removed domains do not leave stale Nginx servers.
-rm -rf "$CERT_OUTPUT_DIR" "$CONFIG_OUTPUT_DIR"
-mkdir -p "$CERT_OUTPUT_DIR" "$CONFIG_OUTPUT_DIR"
+# Rebuild only generated outputs, never the persistent CA.
+rm -rf "$OUTPUT_DIR/certs" "$OUTPUT_DIR/configs" "$OUTPUT_DIR/stream"
+mkdir -p "$OUTPUT_DIR/certs" "$OUTPUT_DIR/configs" "$OUTPUT_DIR/stream"
+tmp_dir=$(mktemp -d "$OUTPUT_DIR/.generate.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+: >"$tmp_dir/seen"
 
 for domains_file in "$DOMAINS_DIR"/*.txt; do
     [ -f "$domains_file" ] || continue
-
     list_name=${domains_file##*/}
     list_name=${list_name%.txt}
     case "$list_name" in
-        ''|*[!A-Za-z0-9._-]*)
-            printf 'Skipping invalid domain list filename: %s\n' "$domains_file" >&2
-            continue
-            ;;
+        ''|.|..|*[!A-Za-z0-9._-]*)
+            printf 'Invalid domain list filename: %s\n' "$domains_file" >&2
+            exit 1 ;;
     esac
 
-    list_cert_dir=$CERT_OUTPUT_DIR/$list_name
-    list_config_file=$CONFIG_OUTPUT_DIR/$list_name.conf
+    list_cert_dir=$OUTPUT_DIR/certs/$list_name
+    list_config_file=$OUTPUT_DIR/configs/$list_name.conf
+    list_stream_file=$OUTPUT_DIR/stream/$list_name.conf
     mkdir -p "$list_cert_dir"
     : >"$list_config_file"
+    : >"$list_stream_file"
 
-    # An environment override takes precedence over the first line.
-    env_name=$(printf '%s' "$list_name" | tr '[:lower:]-.' '[:upper:]__')_UPSTREAM_URL
-    eval "override_url=\${$env_name-}"
-
+    env_name=$(printf '%s' "$list_name" | tr '[:lower:].-' '[:upper:]__')_UPSTREAM_URL
+    override_url=$(printenv "$env_name" || :)
     exec 3< "$domains_file"
-    IFS= read -r upstream <&3 || upstream=''
+    upstream=''
+    IFS= read -r upstream <&3 || :
     upstream=${upstream%$(printf '\r')}
-
-    if [ -n "$override_url" ]; then
-        case "$override_url" in
-            http://*|https://*) ;;
-            *)
-                printf 'Skipping %s: %s must start with http:// or https://\n' "$domains_file" "$env_name" >&2
-                exec 3<&-
-                continue
-                ;;
-        esac
-        upstream_url=${override_url%/}
-    else
-        case "$upstream" in
-            ''|'#'*|*[!A-Za-z0-9._:-]*|:*|*:)
-                printf 'Skipping %s: first line must be an upstream hostname or hostname:port\n' "$domains_file" >&2
-                exec 3<&-
-                continue
-                ;;
-        esac
-        upstream_url=http://$upstream
-    fi
+    upstream_url=${override_url:-$upstream}
+    case "$upstream_url" in
+        '') exec 3<&-; continue ;;
+        http://*|https://*) ;;
+        *) upstream_url=http://$upstream_url ;;
+    esac
+    upstream_url=${upstream_url%/}
+    case "$upstream_url" in
+        *[!A-Za-z0-9._~:/%+-]*)
+            printf 'Invalid upstream URL in %s\n' "$domains_file" >&2
+            exit 1 ;;
+    esac
+    authority=${upstream_url#*://}
+    authority=${authority%%/*}
+    upstream_tls_name=${authority%%:*}
+    case "$upstream_tls_name" in
+        ''|*[!A-Za-z0-9._-]*)
+            printf 'Upstream must have a DNS hostname or IPv4 address: %s\n' "$upstream_url" >&2
+            exit 1 ;;
+    esac
 
     while IFS= read -r domain <&3 || [ -n "$domain" ]; do
-        # Strip a possible CR from files edited on Windows.
         domain=${domain%$(printf '\r')}
-        case "$domain" in
-            ''|'#'*) continue ;;
+        case "$domain" in ''|'#'*) continue ;; esac
+        direct=false
+        case "$domain" in !*) direct=true; domain=${domain#?} ;; esac
+        domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+        dns_name=$domain
+        case "$domain" in \*.*) dns_name=${domain#*.} ;; esac
+        case "$dns_name" in
+            ''|.*|*.|*..*|*[!A-Za-z0-9.-]*)
+                printf 'Invalid domain: %s\n' "$domain" >&2
+                exit 1 ;;
         esac
+        if [ "${#dns_name}" -gt 253 ] || ! printf '%s\n' "$dns_name" | grep -Eq -- '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'; then
+            printf 'Invalid DNS labels: %s\n' "$domain" >&2
+            exit 1
+        fi
+        if grep -Fqx -- "$domain" "$tmp_dir/seen"; then
+            printf 'Duplicate domain across lists: %s\n' "$domain" >&2
+            exit 1
+        fi
+        printf '%s\n' "$domain" >>"$tmp_dir/seen"
 
-        proxy_as_is=false
-        case "$domain" in
-            !*)
-                proxy_as_is=true
-                domain=${domain#?}
-                ;;
-        esac
-
-        # Keep output names, certificate subjects, and Nginx values safe.
-        case "$domain" in
-            ''|*[!A-Za-z0-9._*-]*)
-                printf 'Skipping invalid domain name: %s\n' "$domain" >&2
-                continue
-                ;;
-        esac
-
-        key_domain=$domain
-        key_domain=$(printf '%s' "$key_domain" | tr '*' '_')
-        key_file=$list_cert_dir/$key_domain.key
-        csr_file=$list_cert_dir/$key_domain.csr
-        cert_file=$list_cert_dir/$key_domain.crt
-        chain_file=$list_cert_dir/$key_domain.chain.crt
-
-        if [ "$proxy_as_is" = true ]; then
-            proxy_pass_line='proxy_pass https://$host$request_uri;'
-            proxy_ssl_name_line='proxy_ssl_name $host;'
-            proxy_host_line='proxy_set_header Host $host;'
+        if [ "$direct" = true ]; then
+            # Bypass the list upstream, but still terminate listed TLS locally.
+            proxy_target='$scheme://$host$request_uri'
+            proxy_tls_name='$host'
+            proxy_host='$host'
         else
-            proxy_pass_line="proxy_pass $upstream_url/$domain\$request_uri;"
-            proxy_ssl_name_line='proxy_ssl_name $proxy_host;'
-            proxy_host_line='proxy_set_header Host $proxy_host;'
+            proxy_target="$upstream_url/\$host\$request_uri"
+            proxy_tls_name=$upstream_tls_name
+            proxy_host='$proxy_host'
         fi
 
-        ext_file=$(mktemp "${TMPDIR:-/tmp}/generate-cert.XXXXXX")
-        trap 'rm -f "$ext_file"' 0 HUP INT TERM
-
-        cat >"$ext_file" <<EOF
+        printf '%s 127.0.0.1:8443;\n' "$domain" >>"$list_stream_file"
+        key_domain=$(printf '%s' "$domain" | tr '*' '_')
+        key_file=$list_cert_dir/$key_domain.key
+        chain_file=$list_cert_dir/$key_domain.chain.crt
+        cat >"$tmp_dir/extensions" <<EOF
 basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth,clientAuth
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
 subjectAltName=DNS:$domain
 EOF
-
-        openssl ecparam -name "$EC_CURVE" -genkey -noout -out "$key_file"
-        openssl req -new -sha256 -key "$key_file" -out "$csr_file" \
+        openssl ecparam -name secp384r1 -genkey -noout -out "$key_file"
+        openssl req -new -sha384 -key "$key_file" -out "$tmp_dir/leaf.csr" \
             -subj "/C=RU/ST=Saint-Petersburg/L=Saint-Petersburg/O=v3rt3p/OU=https-proxy/CN=$domain"
-        openssl x509 -req -sha256 -days 825 \
-            -in "$csr_file" -CA "$CA_CERT" -CAkey "$CA_KEY" \
+        openssl x509 -req -sha384 -days 365 \
+            -in "$tmp_dir/leaf.csr" -CA "$CA_CERT" -CAkey "$CA_KEY" \
             -set_serial "0x$(openssl rand -hex 16)" \
-            -extfile "$ext_file" -out "$cert_file"
+            -extfile "$tmp_dir/extensions" -out "$tmp_dir/leaf.crt"
+        cat "$tmp_dir/leaf.crt" "$CA_CERT" >"$chain_file"
 
-        cat "$cert_file" "$CA_CERT" >"$chain_file"
-        rm -f "$csr_file" "$cert_file"
-
+        # Wildcard routing uses the concrete requested host, not a literal '*'.
         cat >>"$list_config_file" <<EOF
 server {
     listen 80;
+    listen 127.0.0.1:8443 ssl;
     server_name $domain;
-
-    location / {
-        $proxy_pass_line
-        proxy_http_version 1.1;
-        proxy_ssl_server_name on;
-        $proxy_ssl_name_line
-        proxy_ssl_verify off;
-        $proxy_host_line
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto http;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-    }
-}
-
-server {
-    listen 443 ssl;
-    server_name $domain;
-
     ssl_certificate $NGINX_ROOT/generated/certs/$list_name/$key_domain.chain.crt;
     ssl_certificate_key $NGINX_ROOT/generated/certs/$list_name/$key_domain.key;
 
     location / {
-        $proxy_pass_line
+        proxy_pass $proxy_target;
         proxy_http_version 1.1;
         proxy_ssl_server_name on;
-        $proxy_ssl_name_line
-        proxy_ssl_verify off;
-        $proxy_host_line
+        proxy_ssl_name $proxy_tls_name;
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_set_header Host $proxy_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
     }
 }
 
 EOF
-
-        rm -f "$ext_file"
-        trap - 0 HUP INT TERM
     done
     exec 3<&-
 done
-
-printf '%s\n' "Generated certificates in $CERT_OUTPUT_DIR"
-printf '%s\n' "Generated Nginx configs in $CONFIG_OUTPUT_DIR"
+printf 'Generated private-CA certificates and HTTP/stream configs in %s\n' "$OUTPUT_DIR"
