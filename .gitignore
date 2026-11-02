@@ -1,2 +1,4 @@
 generated/
+logs/
 .claude/
+ssl.log

@@ -83,4 +83,23 @@ Run it with ports 80 and 443 published:
 docker run --rm -p 80:80 -p 443:443 v3rt3p-https-proxy
 ```
 
-The build stage runs `generate.sh`. The final image contains Nginx and the generated runtime files, but does not contain OpenSSL, the source domain lists, the generator script, or the CA private key.
+The build stage compiles Nginx with a local OpenSSL key-log callback patch. The runtime generates certificates and configuration when the container starts.
+
+### TLS Key Logging
+
+TLS key logging is disabled by default. Set `SSL_KEY_LOGGING` to enable NSS/Wireshark-compatible TLS 1.2 and TLS 1.3 key logs at `/logs/ssl.log`:
+
+```sh
+docker run --rm -p 80:80 -p 443:443 \
+  -e SSL_KEY_LOGGING=1 \
+  -v "$PWD/logs:/logs" \
+  v3rt3p-https-proxy
+```
+
+The variable's presence enables logging, including an empty value or `0`; omit it to disable logging. Restart the container after changing the environment. Existing log contents are preserved, and the file is restricted to mode `0600`.
+
+Select `logs/ssl.log` as the TLS key log file in Wireshark. OpenSSL writes secrets immediately as they become available, without waiting for an HTTP request or for a connection to close. This includes handshakes with no HTTP traffic, long-lived connections, and failed handshakes that progressed far enough to derive secrets. Failures before key derivation cannot produce keys.
+
+Both client-facing and upstream TLS handled by Nginx are logged, including stream TLS termination if configured. Unknown-domain TLS passthrough cannot be logged because Nginx does not participate in its handshake. Normal request logging remains on stdout. The patch registers the file with Nginx's log lifecycle, including reopen on `USR1`.
+
+**Warning:** These secrets allow captured TLS traffic to be decrypted. Use only in authorized test environments, protect the mounted directory, and remove or rotate logs when testing is complete.

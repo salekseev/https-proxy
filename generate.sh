@@ -119,6 +119,9 @@ EOF
 server {
     listen 80;
     listen 127.0.0.1:8443 ssl;
+
+    http2 on;
+
     server_name $domain;
     ssl_certificate $NGINX_ROOT/generated/certs/$list_name/$key_domain.chain.crt;
     ssl_certificate_key $NGINX_ROOT/generated/certs/$list_name/$key_domain.key;

@@ -33,3 +33,4 @@ rosenberg.appmetrica.yandex.net
 zen.report.appmetrica.yandex.net
 redirect.appmetrica.yandex.com
 certificate.mobile.yandex.net
+api.lbs.yandex.net
