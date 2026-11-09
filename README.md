@@ -83,7 +83,7 @@ Run it with ports 80 and 443 published:
 docker run --rm -p 80:80 -p 443:443 v3rt3p-https-proxy
 ```
 
-The build stage compiles Nginx with a local OpenSSL key-log callback patch. The runtime generates certificates and configuration when the container starts.
+The build stage compiles Nginx with a local OpenSSL key-log callback patch. Set `SSL_KEYLOG=false` at build time to skip the patch and compile entirely, keeping the stock distribution Nginx binary so the image follows distro security updates for Nginx; TLS key logging is then unavailable (see TLS Key Logging). The runtime generates certificates and configuration when the container starts.
 
 ### TLS Key Logging
 
@@ -96,7 +96,7 @@ docker run --rm -p 80:80 -p 443:443 \
   v3rt3p-https-proxy
 ```
 
-The variable's presence enables logging, including an empty value or `0`; omit it to disable logging. Restart the container after changing the environment. Existing log contents are preserved, and the file is restricted to mode `0600`.
+The variable's presence enables logging, including an empty value or `0`; omit it to disable logging. Restart the container after changing the environment. Existing log contents are preserved, and the file is restricted to mode `0600`. Key logging requires the patched Nginx binary: build with `docker build --build-arg SSL_KEYLOG=false` to skip the patch and the compile stage, in which case the image keeps the stock distribution Nginx (which receives distro security updates) and refuses to start if `SSL_KEY_LOGGING` is set.
 
 Select `logs/ssl.log` as the TLS key log file in Wireshark. OpenSSL writes secrets immediately as they become available, without waiting for an HTTP request or for a connection to close. This includes handshakes with no HTTP traffic, long-lived connections, and failed handshakes that progressed far enough to derive secrets. Failures before key derivation cannot produce keys.
 

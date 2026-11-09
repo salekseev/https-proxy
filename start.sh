@@ -15,6 +15,10 @@ export NGINX_LOCAL_RESOLVERS
 NGINX_SSL_KEY_LOGGING=''
 # Presence enables logging, even if the value is empty or "0".
 if [ "${SSL_KEY_LOGGING+x}" = x ]; then
+    if [ "${SSL_KEYLOG_BUILT:-true}" != true ]; then
+        printf '%s\n' 'SSL_KEY_LOGGING is set, but this image was built with SSL_KEYLOG=false and its Nginx lacks the ssl_key_log directive. Rebuild with SSL_KEYLOG=true or unset SSL_KEY_LOGGING.' >&2
+        exit 1
+    fi
     # Keep files created during log rotation private as well.
     umask 077
     mkdir -p /logs
